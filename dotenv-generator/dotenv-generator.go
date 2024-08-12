@@ -2,30 +2,75 @@ package dotenvgenerator
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
-	"syscall"
-
-	"golang.org/x/term"
 )
 
+var errType error = errors.New("invalid type")
+
 // generate .env file from struct envconfig tags
-func GenerateDotEnv(cfg interface{}) {
-	rows := readStruct(reflect.TypeOf(cfg))
-	text := strings.Join(rows, "\n")
-	err := os.WriteFile(".env", []byte(text), 0644)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+func GenerateDotEnv(cfg interface{}, build, cancelBuildInError bool, p Prompter) (rows []string, err error) {
+	// set prompter
+	if p == nil {
+		p = newPrompter(bufio.NewReader(os.Stdin))
 	}
+
+	// validate type
+	switch reflect.TypeOf(cfg).Kind() {
+	case reflect.Struct:
+		rows = append(rows, readStruct(reflect.TypeOf(cfg), p)...)
+	case reflect.Pointer:
+		val := reflect.ValueOf(cfg).Elem()
+		if val.Kind() != reflect.Struct {
+			return nil, errType
+		}
+		rows = append(rows, readStruct(val.Type(), p)...)
+	case reflect.Slice:
+		val := reflect.ValueOf(cfg)
+		for i := 0; i < val.Len(); i++ {
+			elm, _err := getStructFromElement(val.Index(i), i)
+			if _err != nil {
+				if err != nil {
+					err = fmt.Errorf("%v\n%v", err, _err)
+				} else {
+					err = _err
+				}
+				continue
+			}
+			// add comment
+			if i > 0 {
+				rows = append(rows, "")
+			}
+			rows = append(rows, fmt.Sprintf("#%s", elm.Type().Name()))
+			rows = append(rows, readStruct(elm.Type(), p)...)
+		}
+	default:
+		return nil, errType
+	}
+	if len(rows) == 0 {
+		return
+	}
+
+	text := strings.Join(rows, "\n")
+	if build && (err == nil || !cancelBuildInError) {
+		_err := os.WriteFile(".env", []byte(text), 0644)
+		if _err != nil {
+			if err != nil {
+				err = fmt.Errorf("%v\n%v", err, _err)
+			} else {
+				err = _err
+			}
+		}
+	}
+	return
 }
 
-func readStruct(elm reflect.Type) []string {
+func readStruct(elm reflect.Type, p Prompter) []string {
 	var result []string
-	reader := bufio.NewReader(os.Stdin)
 	numFields := elm.NumField()
 	for i := 0; i < numFields; i++ {
 		// set field, tag, kind
@@ -56,50 +101,30 @@ func readStruct(elm reflect.Type) []string {
 		// scan
 		var scan string
 		if secret {
-			scan = promptPassword(prompt)
+			scan = p.PromptPassword(prompt)
 			fmt.Println()
 		} else {
-			scan = promptString(prompt, reader)
+			scan = p.PromptString(prompt)
 		}
 		if scan == "" && _default != "" {
 			scan = _default
 		}
-
-		// comment
-		if comment := tag.Get("comment"); comment != "" {
-			if i == 0 {
-				result = append(result, fmt.Sprintf("#%s", comment))
-			} else {
-				result = append(result, fmt.Sprintf("\n#%s", comment))
-			}
-		}
-
 		result = append(result, fmt.Sprintf("%s=\"%s\"", envconfig, strings.ReplaceAll(scan, `"`, "")))
 	}
 	return result
 }
 
-func promptString(prompt string, reader *bufio.Reader) string {
-	if reader == nil {
-		reader = bufio.NewReader(os.Stdin)
+func getStructFromElement(itm reflect.Value, n int) (reflect.Value, error) {
+	switch itm.Type().Kind() {
+	case reflect.Interface:
+		return getStructFromElement(itm.Elem(), n)
+	case reflect.Pointer:
+		return getStructFromElement(itm.Elem(), n)
+	case reflect.Struct:
+		return itm, nil
 	}
-
-	fmt.Print(prompt)
-	result, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Println("error getString:", err.Error())
-		os.Exit(1)
+	if n >= 0 {
+		return itm, fmt.Errorf("index #%d invalid type", n)
 	}
-	result = strings.TrimSpace(result)
-	return result
-}
-
-func promptPassword(prompt string) string {
-	fmt.Print(prompt)
-	result, err := term.ReadPassword(syscall.Stdin)
-	if err != nil {
-		fmt.Println("error getString:", err.Error())
-		os.Exit(1)
-	}
-	return strings.TrimSpace(string(result))
+	return itm, errType
 }
